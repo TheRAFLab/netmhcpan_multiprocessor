@@ -1,0 +1,45 @@
+[project]
+name = "netmhcpan-multiprocessor"
+version = "0.1.0"
+description = "Run netMHCpan over peptide parquet sets in parallel, from a CLI or a pipeline"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.4.2",
+    "polars>=1.43.2",
+    "rich>=15.0.0",
+]
+
+[project.optional-dependencies]
+# Only the proteome preparation step needs these: it reads FASTA and k-merises.
+# Prediction itself reads peptide parquet, so an install that only predicts does
+# not pay for them. Keeping them optional is also what makes the preparation
+# step cheap to move out of this package later.
+proteome = [
+    "polars-bio>=0.33.1",
+    "shared-helpers",
+]
+
+[project.scripts]
+netmhcpan-mp = "netmhcpan_multiprocessor.cli:cli"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.uv.sources]
+shared-helpers = { git = "https://github.com/TheRAFLab/shared_helpers" }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/netmhcpan_multiprocessor"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "netmhcpan: needs a real netMHCpan install; skipped unless $NETMHCPAN is set",
+]
