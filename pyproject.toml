@@ -4,6 +4,10 @@ version = "0.1.0"
 description = "Run netMHCpan over peptide parquet sets in parallel, from a CLI or a pipeline"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "The RAF Lab" }]
+urls = { Repository = "https://github.com/TheRAFLab/netmhcpan_multiprocessor" }
 dependencies = [
     "click>=8.4.2",
     "polars>=1.43.2",
