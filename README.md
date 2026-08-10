@@ -1,13 +1,13 @@
-# netmhcpan_multiprocessor
+# netMHCpan multiprocessor
 
 Run netMHCpan over a set of peptides in parallel, from a terminal or from a Python
 pipeline.
 
-netMHCpan is single threaded, and the peptide lengths are very uneven — 11mers take
-nearly ten times as long as 9mers. This package cuts every peptide set into chunks, pools
-all the chunks together, and hands them out longest first, so a worker that finishes a
-quick 9mer chunk picks up an 11mer chunk instead of leaving a core idle behind the one
-slowest length.
+netMHCpan is single threaded, which is inefficient on modern multiprocessor machines, and
+execution time for different peptide lengths is very uneven — 11mers take nearly ten times
+as long as 9mers. This package cuts every peptide set into chunks, pools all the chunks
+together, and hands them out longest first, so a worker that finishes a quick 9mer chunk
+picks up an 11mer chunk instead of leaving a core idle behind the one slowest length.
 
 Peptide parquet in, prediction parquet out, one file per length per allele, in the input's
 row order so the two join directly.
