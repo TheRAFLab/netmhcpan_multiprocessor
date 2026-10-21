@@ -9,6 +9,12 @@ as long as 9mers. This package cuts every peptide set into chunks, pools all the
 together, and hands them out longest first, so a worker that finishes a quick 9mer chunk
 picks up an 11mer chunk instead of leaving a core idle behind the one slowest length.
 
+It also cuts how much work there is to spread. Most of what netMHCpan does to a peptide —
+enumerating how a long peptide aligns to the 9mer binding core — does not depend on the
+allele, so `--alleles-per-process` scores a batch of alleles in one call. A 12mer chunk
+against 32 alleles costs about a quarter of what those alleles cost a process each, and a
+whole panel over a proteome comes down from days to hours.
+
 Peptide parquet in, prediction parquet out, one file per length per allele, in the input's
 row order so the two join directly.
 
@@ -403,6 +409,7 @@ netmhcpan-mp predict --config pipeline.toml
 | `scores` / `--scores` | `el` | `el`, or `ba` for affinity as well |
 | `netmhcpan_path` / `--netmhcpan` | `$NETMHCPAN`, then `PATH` | the executable |
 | `chunk_size` / `--chunk-size` | `5000` | peptides per netMHCpan process |
+| `alleles_per_process` / `--alleles-per-process` | `1` | alleles scored in one process, or `0` for all |
 | `workers` / `--workers` | CPU count | concurrent processes |
 | `peptide_column` / `--peptide-column` | `peptide_sequence` | |
 | `raw_output_folder` / `--raw-output-folder` | none | also keep netMHCpan's text output |
@@ -634,6 +641,14 @@ Every netMHCpan process is single threaded, so throughput is `--workers` process
 defaulting to your core count. `--verbose` shows what was resolved. If the machine is shared,
 lower `--workers`; if a run is dominated by one long length, lower `--chunk-size` so the work
 spreads more evenly.
+
+For more than a handful of alleles, `--alleles-per-process 0` is the one setting that
+changes the order of magnitude: the alleles share a process instead of repeating the same
+allele-independent work. Because a batch multiplies what a chunk costs, pair it with a
+smaller `--chunk-size` — aim for a chunk that takes seconds rather than minutes, or one
+slow chunk will be the whole run's finishing time. The trade-off is isolation: a chunk
+that fails takes every allele in its batch with it, so if one allele is doubtful, predict
+it on its own.
 
 **Still stuck**
 

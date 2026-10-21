@@ -8,6 +8,7 @@ from netmhcpan_multiprocessor.parsing import (
     DEFAULT_SCORES,
     build_predictions_frame,
     get_score_set,
+    split_rows_by_allele,
     is_prediction_row,
     write_raw_predictions,
 )
@@ -160,3 +161,32 @@ class TestScoreSets:
     def test_reading_eluted_ligand_rows_as_affinity_is_refused(self):
         with pytest.raises(NetMHCpanRunError, match="scores='el'"):
             build_predictions_frame([NON_BINDER], 'hla_a_02_01', 'ba')
+
+
+class TestSplittingABatch:
+    def test_rows_are_grouped_by_allele_slug(self):
+        other_allele = NON_BINDER.replace('HLA-A*02:01', 'HLA-B*07:02')
+        rows_by_allele = split_rows_by_allele([NON_BINDER, STRONG_BINDER, other_allele])
+        assert set(rows_by_allele) == {'hla_a_02_01', 'hla_b_07_02'}
+        assert rows_by_allele['hla_a_02_01'] == [NON_BINDER, STRONG_BINDER]
+        assert rows_by_allele['hla_b_07_02'] == [other_allele]
+
+    def test_an_allele_keeps_the_order_its_rows_arrived_in(self):
+        rows = [STRONG_BINDER, NON_BINDER, WEAK_BINDER]
+        assert split_rows_by_allele(rows)['hla_a_02_01'] == rows
+
+    def test_a_non_hla_allele_groups_under_its_own_slug(self):
+        # H-2-Db and the like have no starred form, so the slug is the name.
+        row = NON_BINDER.replace('HLA-A*02:01', 'H-2-Db')
+        assert list(split_rows_by_allele([row])) == ['h_2_db']
+
+    def test_a_row_with_no_allele_column_is_an_error(self):
+        with pytest.raises(NetMHCpanRunError, match='no allele column'):
+            split_rows_by_allele(['   1\n'])
+
+    def test_a_split_block_parses_as_its_own_frame(self):
+        other_allele = STRONG_BINDER.replace('HLA-A*02:01', 'HLA-B*07:02')
+        rows_by_allele = split_rows_by_allele([STRONG_BINDER, other_allele])
+        frame = build_predictions_frame(rows_by_allele['hla_b_07_02'], 'hla_b_07_02')
+        assert frame['allele_slug'].to_list() == ['hla_b_07_02']
+        assert frame['peptide_sequence'].to_list() == ['SLYNTVATL']

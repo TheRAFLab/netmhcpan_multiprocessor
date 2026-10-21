@@ -4,13 +4,21 @@ Running netMHCpan over a single chunk of peptides.
 One process per chunk, its stdout read as it arrives so predictions can be
 counted while they stream. Everything about detecting a failed run lives here,
 because netMHCpan has more than one way of not doing what was asked.
+
+A chunk can be scored against several alleles in the one process. Most of what
+netMHCpan does to a peptide - enumerating how a long peptide aligns to the 9mer
+binding core - does not depend on the allele, so it is done once however many
+alleles are asked for: a 12mer chunk against 32 alleles costs about a quarter
+of what those 32 alleles cost as a process each. The output then carries one
+block of rows per allele, in the order the alleles were given, each block
+numbered from 1.
 """
 
 import os
 import signal
 import subprocess
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from netmhcpan_multiprocessor.chunking import PeptideChunk
@@ -32,20 +40,22 @@ STDERR_GRACE_SECONDS = 5
 def run_chunk(
     netmhcpan_path: Path,
     chunk: PeptideChunk,
-    allele: str,
+    alleles: str | Sequence[str],
     advance: Callable[[int], None] | None = None,
     arguments: tuple[str, ...] = (),
     on_warning: Callable[[str], None] | None = None,
 ) -> list[str]:
     """
-    Run netMHCpan over one chunk of peptides.
+    Run netMHCpan over one chunk of peptides, against one or more alleles.
 
     Args:
         netmhcpan_path (Path): the netMHCpan executable.
         chunk (PeptideChunk): the chunk file and how many peptides it holds.
-        allele (str): the allele in netMHCpan's own naming, e.g. 'HLA-A02:01'.
+        alleles (str | Sequence[str]): the alleles in netMHCpan's own naming,
+            e.g. 'HLA-A02:01', or several of them to score in this one process.
         advance (Callable[[int], None] | None): called with 1 for each prediction
-            as it arrives, so a caller can show progress within the chunk.
+            as it arrives, so a caller can show progress within the chunk. With
+            several alleles that is one prediction per peptide per allele.
         arguments (tuple[str, ...]): extra netMHCpan arguments, such as the -BA
             that asks for binding affinity as well as eluted ligand likelihood.
         on_warning (Callable[[str], None] | None): called with each line netMHCpan
@@ -53,21 +63,26 @@ def run_chunk(
             same output goes into the error instead, so it is never lost twice.
 
     Returns:
-        list[str]: the chunk's prediction rows, banner and summary stripped, in
-            the order the peptides were given.
+        list[str]: the chunk's prediction rows, banner and summary stripped: one
+            block per allele in the order the alleles were given, and within each
+            block one row per peptide in the order the peptides were given.
 
     Raises:
         NetMHCpanRunError: if netMHCpan could not be started, exited non-zero,
             reported an error, or returned anything other than one prediction
-            per peptide in the order they were supplied.
+            per peptide per allele in the order they were supplied.
     """
+    allele_names = [alleles] if isinstance(alleles, str) else list(alleles)
+    if not allele_names:
+        raise NetMHCpanRunError("At least one allele is needed to run a chunk")
     # No shell, and stdout read here rather than redirected with '>', so a failed
     # run raises instead of silently leaving a zero byte results file behind.
     # Popen rather than run() so predictions can be counted as they stream, which
     # turns a spinner that only proves the process is alive into a real bar.
     try:
         process = subprocess.Popen(
-            [str(netmhcpan_path), '-p', str(chunk.path), '-a', allele, *arguments],
+            # netMHCpan takes several alleles as one comma separated -a value.
+            [str(netmhcpan_path), '-p', str(chunk.path), '-a', ','.join(allele_names), *arguments],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -129,12 +144,18 @@ def run_chunk(
     if error_lines:
         raise NetMHCpanRunError(' '.join(error_lines))
     # Backstop for any other way netMHCpan might quietly return less than asked:
-    # one prediction per peptide is the whole contract of -p mode.
-    if len(prediction_rows) != chunk.peptide_count:
-        raise NetMHCpanRunError(
-            f"expected {chunk.peptide_count} predictions, got {len(prediction_rows)}"
+    # one prediction per peptide per allele is the whole contract of -p mode.
+    expected_rows = chunk.peptide_count * len(allele_names)
+    if len(prediction_rows) != expected_rows:
+        # The arithmetic is only worth spelling out when there is some.
+        detail = (
+            f" ({chunk.peptide_count} peptides x {len(allele_names)} alleles)"
+            if len(allele_names) > 1 else ''
         )
-    _check_peptide_order(prediction_rows, chunk)
+        raise NetMHCpanRunError(
+            f"expected {expected_rows} predictions{detail}, got {len(prediction_rows)}"
+        )
+    _check_peptide_order(prediction_rows, chunk, len(allele_names))
 
     # Only on the way out of a successful run: a chunk that failed has already
     # put this same output into its error message.
@@ -178,22 +199,28 @@ def _terminate(process: subprocess.Popen) -> None:
         process.kill()
 
 
-def _check_peptide_order(prediction_rows: list[str], chunk: PeptideChunk) -> None:
+def _check_peptide_order(prediction_rows: list[str], chunk: PeptideChunk, allele_count: int) -> None:
     # The output parquet is written in this order and joined back to the peptide
     # parquet positionally, so 'netMHCpan answers in the order it was asked' is
     # load bearing. It is also the one assumption nothing else would catch: a
     # reordered result is self-consistent, since the peptide column comes from
     # netMHCpan's own output, and would silently mismatch the input instead.
+    # Checked per allele block, because with several alleles the peptide list
+    # comes back once per allele rather than once.
     expected = [line.strip() for line in chunk.path.read_text().splitlines() if line.strip()]
-    returned = [row.split(maxsplit=3)[2] for row in prediction_rows]
-    if returned != expected:
+    for block in range(allele_count):
+        rows = prediction_rows[block * len(expected):(block + 1) * len(expected)]
+        returned = [row.split(maxsplit=3)[2] for row in rows]
+        if returned == expected:
+            continue
         difference = next(
             (index for index, (was, got) in enumerate(zip(expected, returned)) if was != got),
             min(len(expected), len(returned)),
         )
+        allele = rows[difference].split()[1] if difference < len(rows) else 'unknown'
         raise NetMHCpanRunError(
             f"netMHCpan returned peptides in a different order to the input: "
-            f"position {difference + 1} was "
+            f"allele {allele}, position {difference + 1} was "
             f"{expected[difference] if difference < len(expected) else 'nothing'!r}, "
             f"got {returned[difference] if difference < len(returned) else 'nothing'!r}"
         )

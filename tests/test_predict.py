@@ -290,10 +290,10 @@ class TestFailureIsolationIsThorough:
 
         real_run_chunk = predict_module.run_chunk
 
-        def sometimes_broken(*arguments, allele, **keywords):
-            if allele == 'HLA-B07:02':
+        def sometimes_broken(*arguments, alleles, **keywords):
+            if 'HLA-B07:02' in alleles:
                 raise RuntimeError('something nobody anticipated')
-            return real_run_chunk(*arguments, allele=allele, **keywords)
+            return real_run_chunk(*arguments, alleles=alleles, **keywords)
 
         monkeypatch.setattr(predict_module, 'run_chunk', sometimes_broken)
 
@@ -409,3 +409,131 @@ class TestWarnings:
         result = predict(prediction_settings)
         assert not result.succeeded
         assert all(run.warnings == [] for run in result.runs)
+
+
+class TestAllelesPerProcess:
+    """Scoring several alleles in one netMHCpan process, which is most of what a long run costs."""
+
+    PANEL = ['HLA-A*02:01', 'HLA-B*07:02', 'HLA-C*07:02']
+
+    def record_batches(self, monkeypatch):
+        """list: the alleles each netMHCpan process was given, as the run goes."""
+        predict_module = importlib.import_module('netmhcpan_multiprocessor.predict')
+        real_run_chunk = predict_module.run_chunk
+        batches = []
+
+        def recording(*arguments, alleles, **keywords):
+            batches.append(list(alleles))
+            return real_run_chunk(*arguments, alleles=alleles, **keywords)
+
+        monkeypatch.setattr(predict_module, 'run_chunk', recording)
+        return batches
+
+    def test_one_allele_per_process_by_default(self, prediction_settings, monkeypatch):
+        batches = self.record_batches(monkeypatch)
+        predict({**prediction_settings, 'alleles': self.PANEL})
+        assert all(len(batch) == 1 for batch in batches)
+
+    def test_a_batch_scores_its_alleles_in_one_process(self, prediction_settings, monkeypatch):
+        batches = self.record_batches(monkeypatch)
+        predict({**prediction_settings, 'alleles': self.PANEL, 'alleles_per_process': 3})
+        assert all(len(batch) == 3 for batch in batches)
+        # Three alleles over two lengths, in chunks of ten: six processes rather
+        # than the eighteen the same work takes one allele at a time.
+        assert len(batches) == 6
+
+    def test_zero_means_every_allele_in_one_batch(self, prediction_settings, monkeypatch):
+        batches = self.record_batches(monkeypatch)
+        predict({**prediction_settings, 'alleles': self.PANEL, 'alleles_per_process': 0})
+        assert all(len(batch) == len(self.PANEL) for batch in batches)
+
+    def test_a_batch_larger_than_the_panel_is_the_panel(self, prediction_settings, monkeypatch):
+        batches = self.record_batches(monkeypatch)
+        predict({**prediction_settings, 'alleles': self.PANEL, 'alleles_per_process': 99})
+        assert all(len(batch) == len(self.PANEL) for batch in batches)
+
+    def test_batching_changes_nothing_about_the_output(self, prediction_settings, tmp_path):
+        one_at_a_time = tmp_path / 'separate'
+        batched = tmp_path / 'batched'
+        predict({**prediction_settings, 'alleles': self.PANEL, 'output_folder': one_at_a_time})
+        predict({
+            **prediction_settings, 'alleles': self.PANEL,
+            'output_folder': batched, 'alleles_per_process': 0,
+        })
+        written = sorted(path.relative_to(batched) for path in batched.rglob('*.parquet'))
+        assert written == sorted(path.relative_to(one_at_a_time)
+                                 for path in one_at_a_time.rglob('*.parquet'))
+        for path in written:
+            assert pl.read_parquet(batched / path).equals(pl.read_parquet(one_at_a_time / path))
+
+    def test_every_allele_is_reported_as_its_own_run(self, prediction_settings):
+        result = predict({
+            **prediction_settings, 'alleles': self.PANEL, 'alleles_per_process': 0,
+        })
+        # Three alleles over two lengths, whatever they shared a process with.
+        assert len(result.runs) == 6
+        assert {run.allele for run in result.runs} == set(self.PANEL)
+        assert all(run.peptide_count == 30 for run in result.runs)
+
+    def test_a_resumed_run_batches_only_what_is_missing(self, prediction_settings,
+                                                        output_folder, monkeypatch):
+        # The point of batching after the skip: a run that stopped part way
+        # fills its processes with the alleles still to do.
+        predict({**prediction_settings, 'alleles': self.PANEL[:1]})
+        batches = self.record_batches(monkeypatch)
+        result = predict({
+            **prediction_settings, 'alleles': self.PANEL,
+            'alleles_per_process': 0, 'overwrite': False,
+        })
+        assert all(batch == ['HLA-B07:02', 'HLA-C07:02'] for batch in batches)
+        assert {run.allele for run in result.runs if run.skipped} == {'HLA-A*02:01'}
+
+    def test_a_failed_batch_fails_every_allele_in_it(self, prediction_settings,
+                                                     output_folder, monkeypatch):
+        # The trade-off of sharing a process: one allele netMHCpan cannot do
+        # takes its batch down with it. Alleles are checked against netMHCpan's
+        # own list before any work starts, so this is the rare case.
+        monkeypatch.setenv('FAKE_NETMHCPAN_FAIL_MODE', 'exit')
+        monkeypatch.setenv('FAKE_NETMHCPAN_FAIL_ALLELE', 'HLA-C07:02')
+        result = predict({
+            **prediction_settings, 'alleles': self.PANEL, 'alleles_per_process': 0,
+        })
+        assert {run.allele for run in result.failures} == set(self.PANEL)
+        assert not list(output_folder.rglob('*.parquet'))
+
+    def test_one_allele_per_process_still_isolates_a_failure(self, prediction_settings,
+                                                             output_folder, monkeypatch):
+        monkeypatch.setenv('FAKE_NETMHCPAN_FAIL_MODE', 'exit')
+        monkeypatch.setenv('FAKE_NETMHCPAN_FAIL_ALLELE', 'HLA-C07:02')
+        result = predict({**prediction_settings, 'alleles': self.PANEL})
+        assert {run.allele for run in result.failures} == {'HLA-C*07:02'}
+        assert (output_folder / 'hla_a_02_01' / '9mers' / 'testset.parquet').exists()
+
+    def test_a_batch_reports_progress_for_every_allele(self, prediction_settings):
+        class Reporter:
+            def __init__(self):
+                self.totals = []
+                self.advanced = 0
+
+            def add_run(self, label, total):
+                self.totals.append(total)
+                return label
+
+            def advance(self, handle, amount=1):
+                self.advanced += amount
+
+            def fail(self, handle, message):
+                raise AssertionError(f"unexpected failure: {message}")
+
+        reporter = Reporter()
+        predict(
+            {**prediction_settings, 'alleles': self.PANEL, 'alleles_per_process': 0},
+            progress=reporter,
+        )
+        # One bar per length, each covering its three alleles' 30 peptides.
+        assert reporter.totals == [90, 90]
+        assert reporter.advanced == 180
+
+    def test_a_negative_batch_is_refused(self, prediction_settings):
+        with pytest.raises(ConfigError, match='alleles_per_process cannot be negative'):
+            predict({**prediction_settings, 'alleles_per_process': -1})
