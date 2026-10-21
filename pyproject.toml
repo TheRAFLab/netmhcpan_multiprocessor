@@ -1,6 +1,6 @@
 [project]
 name = "netmhcpan-multiprocessor"
-version = "0.1.0"
+version = "0.2.0"
 description = "Run netMHCpan over peptide parquet sets in parallel, from a CLI or a pipeline"
 readme = "README.md"
 requires-python = ">=3.12"
