@@ -46,7 +46,7 @@ from netmhcpan_multiprocessor.parsing import PREDICTION_COLUMNS
 from netmhcpan_multiprocessor.predict import PredictionResult, RunResult, predict
 from netmhcpan_multiprocessor.progress import NullProgressReporter, ProgressReporter
 
-__version__ = '0.1.0'
+__version__ = '0.2.0'
 
 
 def prepare(config: PrepareConfig | dict | None = None, **settings) -> PrepareResult:
