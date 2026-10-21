@@ -93,3 +93,35 @@ def test_a_real_unusable_allele_is_caught(settings):
     # validation is turned off here to let the request reach it.
     result = predict({**settings, 'alleles': ['HLA-A*99:99'], 'validate_alleles': False})
     assert not result.succeeded
+
+
+PANEL = ['HLA-A*02:01', 'HLA-B*07:02', 'HLA-C*07:02']
+
+
+def test_a_real_batch_matches_one_allele_per_process(settings, tmp_path):
+    # The assumption batching rests on: netMHCpan given several alleles answers
+    # with a block per allele, and those blocks hold exactly what the same
+    # alleles return one process at a time.
+    separate = tmp_path / 'separate'
+    batched = tmp_path / 'batched'
+    assert predict({**settings, 'alleles': PANEL, 'output_folder': separate}).succeeded
+    assert predict({
+        **settings, 'alleles': PANEL, 'output_folder': batched, 'alleles_per_process': 0,
+    }).succeeded
+
+    for allele_slug in ('hla_a_02_01', 'hla_b_07_02', 'hla_c_07_02'):
+        path = allele_slug + '/9mers/testset.parquet'
+        assert pl.read_parquet(batched / path).equals(pl.read_parquet(separate / path))
+
+
+def test_a_real_batch_keeps_each_allele_in_input_order(settings, tmp_path):
+    # Order is what the positional join back to the peptide parquet rests on, and
+    # a batch is where it could go wrong: the peptides come back once per allele.
+    assert predict({
+        **settings, 'alleles': PANEL, 'alleles_per_process': 0, 'chunk_size': 2,
+    }).succeeded
+    for allele_slug in ('hla_a_02_01', 'hla_b_07_02', 'hla_c_07_02'):
+        predictions = pl.read_parquet(
+            tmp_path / 'predictions' / allele_slug / '9mers' / 'testset.parquet')
+        assert predictions['peptide_sequence'].to_list() == PEPTIDES
+        assert predictions['allele_slug'].to_list() == [allele_slug] * len(PEPTIDES)

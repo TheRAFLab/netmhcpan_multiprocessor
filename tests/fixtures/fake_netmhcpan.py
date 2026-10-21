@@ -8,10 +8,14 @@ summary - and it can be told, through the environment, to fail in each of the
 ways netMHCpan actually fails. Only the standard library is used, so it runs
 under whatever python3 the shebang finds.
 
+It takes one or more alleles on -a, comma separated, and writes a block of rows
+per allele as the real program does.
+
 Environment:
     FAKE_NETMHCPAN_FAIL_ALLELE  only misbehave for this allele, so a run with
-                                several alleles can have exactly one go wrong.
-                                Unset means every allele misbehaves.
+                                several alleles - whether as separate processes
+                                or batched into one - can have exactly one go
+                                wrong. Unset means every allele misbehaves.
     FAKE_NETMHCPAN_FAIL_MODE    'exit'     exit non-zero with a message on stderr
                                 'error'    print 'Error.' to stdout and exit 0,
                                            which is what an unusable allele does
@@ -61,8 +65,9 @@ def parse_arguments(argv):
         argv (list[str]): the command line, without the program name.
 
     Returns:
-        tuple[str | None, str | None, bool, bool]: peptide file, allele, list
-            mode, and whether binding affinity was asked for.
+        tuple[str | None, str | None, bool, bool]: peptide file, the -a value
+            (which may name several alleles, comma separated), list mode, and
+            whether binding affinity was asked for.
     """
     peptide_file, allele, list_alleles, affinity = None, None, False, False
     remaining = list(argv)
@@ -188,9 +193,13 @@ def main(argv):
             sys.stderr.write(warning * (stderr_bytes // len(warning) + 1))
             sys.stderr.flush()
 
+    # -a takes a comma separated list, and the real program then writes one block
+    # of rows per allele, in the order given, each block numbered from 1.
+    alleles = [name for name in (allele or '').split(',') if name]
+
     fail_mode = os.environ.get('FAKE_NETMHCPAN_FAIL_MODE')
     fail_allele = os.environ.get('FAKE_NETMHCPAN_FAIL_ALLELE')
-    misbehaving = bool(fail_mode) and (fail_allele in (None, '', allele))
+    misbehaving = bool(fail_mode) and (fail_allele in (None, '') or fail_allele in alleles)
 
     if misbehaving and fail_mode == 'exit':
         print(f"could not open {peptide_file}", file=sys.stderr)
@@ -199,33 +208,39 @@ def main(argv):
         # An unusable allele: netMHCpan says so on stdout and then exits 0.
         for line in banner(peptide_file, allele):
             print(line)
-        print(f'Error. MHC molecule {allele} not found.')
+        print(f'Error. MHC molecule {fail_allele or allele} not found.')
         return 0
 
     with open(peptide_file) as peptide_handle:
         peptides = [line.strip() for line in peptide_handle if line.strip()]
-    if misbehaving and fail_mode == 'truncate':
-        peptides = peptides[:-1]
-    if misbehaving and fail_mode == 'shuffle':
-        # Every peptide, answered in a different order than it was asked. A
-        # reversal rather than a random shuffle, so the test is deterministic.
-        peptides = peptides[::-1]
 
     for line in banner(peptide_file, allele):
         print(line)
     print(HEADER_RULE)
     print(COLUMN_HEADER + (AFFINITY_HEADER if affinity else '') + ' BindLevel')
     print(HEADER_RULE)
-    for position, peptide in enumerate(peptides, start=1):
-        print(prediction_row(position, allele, peptide, affinity))
+    for name in alleles:
+        # Only the allele asked to misbehave does, so a run of several alleles
+        # can have exactly one of them come back wrong.
+        wrong = bool(fail_mode) and (fail_allele in (None, '', name))
+        answered = list(peptides)
+        if wrong and fail_mode == 'truncate':
+            answered = answered[:-1]
+        if wrong and fail_mode == 'shuffle':
+            # Every peptide, answered in a different order than it was asked. A
+            # reversal rather than a random shuffle, so the test is deterministic.
+            answered = answered[::-1]
+        for position, peptide in enumerate(answered, start=1):
+            print(prediction_row(position, name, peptide, affinity))
     print(HEADER_RULE)
     print()
     strong = sum(1 for peptide in peptides if peptide.startswith('S'))
     weak = sum(1 for peptide in peptides if peptide.startswith('W'))
-    print(
-        f"Protein PEPLIST. Allele {allele}. Number of high binders {strong}. "
-        f"Number of weak binders {weak}. Number of peptides {len(peptides)}"
-    )
+    for name in alleles:
+        print(
+            f"Protein PEPLIST. Allele {name}. Number of high binders {strong}. "
+            f"Number of weak binders {weak}. Number of peptides {len(peptides)}"
+        )
     print()
     print(HEADER_RULE)
     return 0

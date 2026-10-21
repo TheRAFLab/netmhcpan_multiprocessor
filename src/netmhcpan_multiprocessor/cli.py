@@ -164,6 +164,11 @@ def cli() -> None:
                    f"${NETMHCPAN_ENVIRONMENT_VARIABLE}, then PATH.")
 @click.option('--chunk-size', 'chunk_size', type=int, default=5000, show_default=True,
               help="Peptides per netMHCpan process. Smaller chunks balance the workers better.")
+@click.option('--alleles-per-process', 'alleles_per_process', type=int,
+              default=PredictionConfig.alleles_per_process, show_default=True,
+              help="Alleles scored in one netMHCpan process, or 0 for all of them. A batch "
+                   "costs far less than a process each, but multiplies what one chunk costs, "
+                   "so raise it alongside a smaller --chunk-size.")
 @click.option('--workers', 'workers', type=int, default=PredictionConfig.workers, show_default=True,
               help="Concurrent netMHCpan processes.")
 @click.option('--peptide-column', 'peptide_column', default='peptide_sequence', show_default=True,
@@ -235,8 +240,8 @@ def predict(context: click.Context, config_file, quiet, verbose, **_options) -> 
 
 PREDICT_OPTIONS = (
     'input_folder', 'output_folder', 'alleles', 'lengths', 'mode', 'source',
-    'scores', 'netmhcpan_path', 'chunk_size', 'workers', 'peptide_column',
-    'raw_output_folder', 'validate_alleles', 'overwrite', 'strict',
+    'scores', 'netmhcpan_path', 'chunk_size', 'alleles_per_process', 'workers',
+    'peptide_column', 'raw_output_folder', 'validate_alleles', 'overwrite', 'strict',
 )
 
 

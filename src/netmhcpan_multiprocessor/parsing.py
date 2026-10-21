@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 import polars as pl
 
+from netmhcpan_multiprocessor.alleles import slugify
 from netmhcpan_multiprocessor.errors import ConfigError, NetMHCpanRunError
 
 
@@ -157,6 +158,36 @@ def is_prediction_row(line: str) -> bool:
     # characters, so it loses its indent once the position reaches 1000.
     fields = line.split(maxsplit=1)
     return bool(fields) and fields[0].isdigit()
+
+
+def split_rows_by_allele(prediction_rows: list[str]) -> dict[str, list[str]]:
+    """
+    Group prediction rows by the allele netMHCpan names in each one.
+
+    Args:
+        prediction_rows (list[str]): prediction rows, as a run against one or
+            more alleles returns them.
+
+    Returns:
+        dict[str, list[str]]: the rows for each allele, keyed by its slug and
+            holding that allele's rows in the order they were returned, which is
+            the order the peptides were given. Keyed by slug rather than by the
+            printed name because the name is netMHCpan's own spelling, and the
+            slug is what the rest of this package identifies an allele by.
+
+    Raises:
+        NetMHCpanRunError: if a row has no allele column to group on.
+    """
+    rows_by_allele: dict[str, list[str]] = {}
+    for row in prediction_rows:
+        fields = row.split(maxsplit=2)
+        if len(fields) < 2:
+            raise NetMHCpanRunError(f"netMHCpan row has no allele column: {row.strip()!r}")
+        # The rows print the allele in its starred form, which is the form the
+        # slug is built from, so one slugify lands on the same slug a resolved
+        # allele carries.
+        rows_by_allele.setdefault(slugify(fields[1]), []).append(row)
+    return rows_by_allele
 
 
 def build_predictions_frame(

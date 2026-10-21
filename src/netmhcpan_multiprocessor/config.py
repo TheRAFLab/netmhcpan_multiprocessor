@@ -258,6 +258,12 @@ class PredictionConfig(_ConfigFromMapping):
         netmhcpan_path (Path): the netMHCpan executable, resolved at construction.
         chunk_size (int): peptides per netMHCpan process. Smaller chunks balance
             the workers better.
+        alleles_per_process (int): how many alleles one netMHCpan process scores
+            at once. Most of the work on a peptide does not depend on the allele,
+            so scoring a batch of alleles together costs far less than a process
+            each - about a quarter, for 32 alleles. A batch multiplies what one
+            chunk costs, though, so raising this is worth a smaller chunk_size.
+            0 puts every allele in one batch.
         workers (int): concurrent netMHCpan processes.
         peptide_column (str): the column holding peptide sequences.
         raw_output_folder (Path | None): where to write netMHCpan's own text
@@ -275,6 +281,7 @@ class PredictionConfig(_ConfigFromMapping):
     scores: str = DEFAULT_SCORES
     netmhcpan_path: Path | None = None
     chunk_size: int = 5000
+    alleles_per_process: int = 1
     workers: int = os.cpu_count() or 1
     peptide_column: str = 'peptide_sequence'
     raw_output_folder: Path | None = None
@@ -297,6 +304,10 @@ class PredictionConfig(_ConfigFromMapping):
             raise ConfigError("At least one allele is needed")
         if self.chunk_size < 1:
             raise ConfigError(f"chunk_size must be at least 1, got {self.chunk_size}")
+        if self.alleles_per_process < 0:
+            raise ConfigError(
+                f"alleles_per_process cannot be negative, got {self.alleles_per_process}"
+            )
         if self.workers < 1:
             raise ConfigError(f"workers must be at least 1, got {self.workers}")
         # Resolved rather than merely checked, so a mode, source or scores typo

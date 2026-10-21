@@ -5,6 +5,14 @@ Peptides in as parquet, predictions out as parquet. Everything between is about
 using more than one core well: each netMHCpan process is single threaded and the
 lengths are very uneven - 11mers take nearly ten times as long as 9mers - so the
 work is cut into chunks, pooled flat, and handed out longest first.
+
+The other saving is in how many processes the work needs at all. Most of what
+netMHCpan does to a peptide does not depend on the allele, so `alleles_per_process`
+batches alleles into one call: a chunk against 32 alleles costs about a quarter
+of what those alleles cost a process each. A batch of alleles shares its
+processes but not its results, which are still one parquet per allele, and
+batches are built after the skip, so a resumed run fills its processes with the
+alleles still missing.
 """
 
 import os
@@ -22,10 +30,15 @@ from netmhcpan_multiprocessor.chunking import PeptideChunk, write_chunk_files
 from netmhcpan_multiprocessor.config import PredictionConfig, normalise_config_keys
 from netmhcpan_multiprocessor.errors import (
     NetMHCpanMultiprocessorError,
+    NetMHCpanRunError,
     PredictionFailedError,
 )
 from netmhcpan_multiprocessor.modes.base import PeptideFile
-from netmhcpan_multiprocessor.parsing import build_predictions_frame, write_raw_predictions
+from netmhcpan_multiprocessor.parsing import (
+    build_predictions_frame,
+    split_rows_by_allele,
+    write_raw_predictions,
+)
 from netmhcpan_multiprocessor.progress import (
     GuardedProgressReporter,
     NullProgressReporter,
@@ -165,6 +178,25 @@ class _PlannedRun:
         return f"{self.peptide_file.length}mers {self.allele.number}"
 
 
+@dataclass(frozen=True)
+class _PlannedJob:
+    """The runs that share one set of netMHCpan processes, scored in the same calls."""
+    peptide_file: PeptideFile
+    runs: tuple[_PlannedRun, ...]
+
+    @property
+    def allele_names(self) -> list[str]:
+        return [run.allele.netmhcpan_name for run in self.runs]
+
+    @property
+    def label(self) -> str:
+        # One allele reads as it always has; a batch says how many rather than
+        # listing thirty-two names into a progress bar.
+        if len(self.runs) == 1:
+            return self.runs[0].label
+        return f"{self.peptide_file.length}mers {len(self.runs)} alleles"
+
+
 def predict(
     config: PredictionConfig | dict | None = None,
     *,
@@ -245,9 +277,12 @@ def _plan_runs(
     config: PredictionConfig,
     peptide_files: list[PeptideFile],
     alleles: list[ResolvedAllele],
-) -> tuple[list[_PlannedRun], dict[tuple, RunResult]]:
-    # Returns what still has to be run, and the results of everything that does
-    # not - today only the runs skipped because their output is already there.
+) -> tuple[list[_PlannedJob], dict[tuple, RunResult]]:
+    # Returns the jobs that still have to be run, and the results of everything
+    # that does not - today only the runs skipped because their output is
+    # already there. Batched after skipping rather than before, so a resumed run
+    # fills its processes with the alleles still missing instead of carrying the
+    # gaps left by the ones already done.
     planned: list[_PlannedRun] = []
     skipped: dict[tuple, RunResult] = {}
     for peptide_file in peptide_files:
@@ -273,21 +308,37 @@ def _plan_runs(
                 )
                 continue
             planned.append(run)
-    return planned, skipped
+    return _batch_into_jobs(planned, config.alleles_per_process), skipped
+
+
+def _batch_into_jobs(planned: list[_PlannedRun], alleles_per_process: int) -> list[_PlannedJob]:
+    # Grouped by peptide file, because one netMHCpan call takes one peptide file
+    # and any number of alleles.
+    runs_by_file: dict[Path, list[_PlannedRun]] = defaultdict(list)
+    for run in planned:
+        runs_by_file[run.peptide_file.path].append(run)
+
+    jobs = []
+    for runs in runs_by_file.values():
+        batch_size = alleles_per_process or len(runs)
+        for start in range(0, len(runs), batch_size):
+            batch = runs[start:start + batch_size]
+            jobs.append(_PlannedJob(peptide_file=batch[0].peptide_file, runs=tuple(batch)))
+    return jobs
 
 
 def _chunk_peptide_files(
     config: PredictionConfig,
     source,
-    planned: list[_PlannedRun],
+    jobs: list[_PlannedJob],
     chunk_folder: Path,
 ) -> dict[Path, list[PeptideChunk]]:
     # Chunked once per peptide file rather than once per allele: the chunks are
     # the same peptides whichever allele is being predicted, so every extra
     # allele would otherwise rewrite the whole peptide set to disk again.
     chunks_by_file: dict[Path, list[PeptideChunk]] = {}
-    for run in planned:
-        peptide_file = run.peptide_file
+    for job in jobs:
+        peptide_file = job.peptide_file
         if peptide_file.path in chunks_by_file:
             continue
         peptides = source.read_peptides(peptide_file, config.peptide_column)
@@ -302,14 +353,17 @@ def _chunk_peptide_files(
 
 def _run_predictions(
     config: PredictionConfig,
-    planned: list[_PlannedRun],
+    jobs: list[_PlannedJob],
     chunks_by_file: dict[Path, list[PeptideChunk]],
     reporter: ProgressReporter,
 ) -> dict[tuple, RunResult]:
+    # One bar per job rather than per run, because a job's alleles are scored in
+    # the same processes and so make progress together. With one allele per
+    # process a job is a run, and the bars read as they always have.
     handles = {}
-    for run in planned:
-        peptide_count = sum(chunk.peptide_count for chunk in chunks_by_file[run.peptide_file.path])
-        handles[run.key] = reporter.add_run(run.label, peptide_count)
+    for job_index, job in enumerate(jobs):
+        peptide_count = sum(chunk.peptide_count for chunk in chunks_by_file[job.peptide_file.path])
+        handles[job_index] = reporter.add_run(job.label, peptide_count * len(job.runs))
 
     results: dict[tuple, RunResult] = {}
     rows_by_run: dict[tuple, dict[int, list[str]]] = defaultdict(dict)
@@ -318,15 +372,19 @@ def _run_predictions(
     # assembled, so a bounded number of distinct lines survives however many
     # chunks repeat them.
     warnings_by_run: dict[tuple, list[str]] = defaultdict(list)
-    outstanding = {run.key: len(chunks_by_file[run.peptide_file.path]) for run in planned}
+    outstanding = {
+        run.key: len(chunks_by_file[job.peptide_file.path]) for job in jobs for run in job.runs
+    }
     failures: dict[tuple, str] = {}
-    runs_by_key = {run.key: run for run in planned}
+    runs_by_key = {run.key: run for job in jobs for run in job.runs}
 
     # Longest job first: submit the slowest lengths before the quick ones, so the
     # long tail starts early and the short chunks fill in around it. Submitting
     # 8mers first would leave the 11mer chunks queued last, which is what decides
     # the finishing time.
-    longest_first = sorted(planned, key=lambda run: run.peptide_file.length, reverse=True)
+    longest_first = sorted(
+        enumerate(jobs), key=lambda indexed: indexed[1].peptide_file.length, reverse=True
+    )
 
     # Threads rather than processes because the work happens in a subprocess, so
     # the GIL is released for the whole of the wait. One flat pool of chunk jobs
@@ -335,50 +393,63 @@ def _run_predictions(
     executor = ThreadPoolExecutor(max_workers=config.workers)
     try:
         futures = {}
-        for run in longest_first:
-            for chunk_index, chunk in enumerate(chunks_by_file[run.peptide_file.path]):
+        for job_index, job in longest_first:
+            for chunk_index, chunk in enumerate(chunks_by_file[job.peptide_file.path]):
                 future = executor.submit(
                     run_chunk,
                     netmhcpan_path=config.netmhcpan_path,
                     chunk=chunk,
-                    allele=run.allele.netmhcpan_name,
-                    advance=lambda amount, key=run.key: reporter.advance(handles[key], amount),
+                    alleles=job.allele_names,
+                    advance=lambda amount, key=job_index: reporter.advance(handles[key], amount),
                     arguments=config.score_set.arguments,
-                    on_warning=lambda line, key=run.key: warnings_by_run[key].append(line),
+                    on_warning=lambda line, job=job: [
+                        warnings_by_run[run.key].append(line) for run in job.runs
+                    ],
                 )
-                futures[future] = (run.key, chunk_index)
+                futures[future] = (job_index, chunk_index)
 
         for future in as_completed(futures):
-            run_key, chunk_index = futures[future]
+            job_index, chunk_index = futures[future]
+            job = jobs[job_index]
             # Recording failures per run means one bad allele cannot pass for a
             # successful run, while the other runs still finish. Every exception
             # is caught, not just this package's own: a chunk that fails for a
             # reason nobody anticipated - a reporter that raises, undecodable
             # output - must still leave the other runs their results, which is
-            # what a caller is promised when strict is off.
+            # what a caller is promised when strict is off. A chunk carries every
+            # allele in its job, so its failure is all of their failures.
             try:
-                rows_by_run[run_key][chunk_index] = future.result()
+                for run_key, chunk_rows in _rows_by_run(job, future.result()).items():
+                    rows_by_run[run_key][chunk_index] = chunk_rows
             except Exception as chunk_error:
-                if run_key not in failures:
-                    failures[run_key] = _describe(chunk_error)
-                    reporter.fail(handles[run_key], failures[run_key])
+                error = _describe(chunk_error)
+                if not any(run.key in failures for run in job.runs):
+                    reporter.fail(handles[job_index], error)
+                for run in job.runs:
+                    failures.setdefault(run.key, error)
 
-            outstanding[run_key] -= 1
-            if outstanding[run_key]:
-                continue
-            # Assembled and written as soon as its last chunk lands, rather than
-            # after the whole pool drains, so a finished length's rows can be
-            # released instead of every run's rows piling up until the end.
-            results[run_key] = _finalise_run(
-                runs_by_key[run_key],
-                rows_by_run.pop(run_key, {}),
-                chunk_count=len(chunks_by_file[runs_by_key[run_key].peptide_file.path]),
-                score_set=config.score_set,
-                error=failures.get(run_key),
-                warnings=warnings_by_run.pop(run_key, []),
-            )
-            if config.strict and results[run_key].error:
-                # Nothing queued is worth running once the result is known to be
+            stop = False
+            for run in job.runs:
+                run_key = run.key
+                outstanding[run_key] -= 1
+                if outstanding[run_key]:
+                    continue
+                # Assembled and written as soon as its last chunk lands, rather than
+                # after the whole pool drains, so a finished length's rows can be
+                # released instead of every run's rows piling up until the end.
+                results[run_key] = _finalise_run(
+                    runs_by_key[run_key],
+                    rows_by_run.pop(run_key, {}),
+                    chunk_count=len(chunks_by_file[runs_by_key[run_key].peptide_file.path]),
+                    score_set=config.score_set,
+                    error=failures.get(run_key),
+                    warnings=warnings_by_run.pop(run_key, []),
+                )
+                if config.strict and results[run_key].error:
+                    stop = True
+
+            if stop:
+                # Nothing queued is worth running once a result is known to be
                 # a failure, so give back the workers rather than the wall clock.
                 executor.shutdown(wait=False, cancel_futures=True)
                 break
@@ -395,12 +466,17 @@ def _run_predictions(
     # have finished, since a run is only assembled once its last chunk is
     # collected, so this says the run was abandoned rather than that it was
     # never started.
+    job_index_by_run = {run.key: index for index, job in enumerate(jobs) for run in job.runs}
+    reported = set()
     for run_key in outstanding:
         if run_key not in results:
             run = runs_by_key[run_key]
             error = failures.get(run_key, 'abandoned: an earlier failure stopped the run')
-            if run_key not in failures:
-                reporter.fail(handles[run_key], error)
+            # Once per bar, not once per allele sharing it.
+            job_index = job_index_by_run[run_key]
+            if run_key not in failures and job_index not in reported:
+                reported.add(job_index)
+                reporter.fail(handles[job_index], error)
             # Abandoned counts as failed, so its path must not keep an earlier
             # run's parquet either.
             _clear_stale_output(run)
@@ -411,6 +487,29 @@ def _run_predictions(
                 error=error,
             )
     return results
+
+
+def _rows_by_run(job: _PlannedJob, prediction_rows: list[str]) -> dict[tuple, list[str]]:
+    # A job of one allele needs no splitting, which also keeps a single-allele
+    # run from depending on how netMHCpan spells the allele back.
+    if len(job.runs) == 1:
+        return {job.runs[0].key: prediction_rows}
+
+    rows_by_slug = split_rows_by_allele(prediction_rows)
+    asked_for = {run.allele.slug for run in job.runs}
+    missing = [run.allele.number for run in job.runs if run.allele.slug not in rows_by_slug]
+    if missing:
+        raise NetMHCpanRunError(f"netMHCpan returned no predictions for {', '.join(missing)}")
+    # An allele nobody asked for means the rows cannot be trusted to be the ones
+    # this job's output paths are about, so it is a failure rather than something
+    # to quietly drop.
+    unexpected = sorted(set(rows_by_slug) - asked_for)
+    if unexpected:
+        raise NetMHCpanRunError(
+            f"netMHCpan returned predictions for alleles that were not asked for: "
+            f"{', '.join(unexpected)}"
+        )
+    return {run.key: rows_by_slug[run.allele.slug] for run in job.runs}
 
 
 def _describe(error: Exception) -> str:

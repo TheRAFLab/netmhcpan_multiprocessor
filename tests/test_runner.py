@@ -138,3 +138,41 @@ def test_affinity_arguments_are_passed_through(fake_netmhcpan, chunk):
     rows = run_chunk(fake_netmhcpan, chunk, 'HLA-A02:01', arguments=('-BA',))
     # -BA widens every row from 13 fields to 16.
     assert len(rows[0].split()) in (16, 18)
+
+
+def test_several_alleles_come_back_as_one_block_each(fake_netmhcpan, chunk):
+    # The saving that makes a batch worth running: one process, every allele.
+    rows = run_chunk(fake_netmhcpan, chunk, ['HLA-A02:01', 'HLA-B07:02'])
+    assert len(rows) == 10
+    assert [row.split()[1] for row in rows[:5]] == ['HLA-A*02:01'] * 5
+    assert [row.split()[1] for row in rows[5:]] == ['HLA-B*07:02'] * 5
+    # Each block answers the peptides in the order they were asked.
+    assert [row.split()[2] for row in rows[:5]] == make_peptides(9, 5)
+    assert [row.split()[2] for row in rows[5:]] == make_peptides(9, 5)
+
+
+def test_a_batch_counts_predictions_for_every_allele(fake_netmhcpan, chunk):
+    advanced = []
+    run_chunk(fake_netmhcpan, chunk, ['HLA-A02:01', 'HLA-B07:02'], advance=advanced.append)
+    assert sum(advanced) == 10
+
+
+def test_a_short_block_in_a_batch_is_a_failure(fake_netmhcpan, chunk, monkeypatch):
+    # One allele of a batch returning less than asked must fail the chunk rather
+    # than leave its rows to be read as another allele's.
+    monkeypatch.setenv('FAKE_NETMHCPAN_FAIL_MODE', 'truncate')
+    monkeypatch.setenv('FAKE_NETMHCPAN_FAIL_ALLELE', 'HLA-B07:02')
+    with pytest.raises(NetMHCpanRunError, match=r'expected 10 predictions \(5 peptides x 2 alleles\)'):
+        run_chunk(fake_netmhcpan, chunk, ['HLA-A02:01', 'HLA-B07:02'])
+
+
+def test_a_reordered_block_in_a_batch_names_the_allele(fake_netmhcpan, chunk, monkeypatch):
+    monkeypatch.setenv('FAKE_NETMHCPAN_FAIL_MODE', 'shuffle')
+    monkeypatch.setenv('FAKE_NETMHCPAN_FAIL_ALLELE', 'HLA-B07:02')
+    with pytest.raises(NetMHCpanRunError, match='different order.*HLA-B\\*07:02'):
+        run_chunk(fake_netmhcpan, chunk, ['HLA-A02:01', 'HLA-B07:02'])
+
+
+def test_no_alleles_is_refused(fake_netmhcpan, chunk):
+    with pytest.raises(NetMHCpanRunError, match='At least one allele'):
+        run_chunk(fake_netmhcpan, chunk, [])
